@@ -1,30 +1,33 @@
 package main
 
 import (
-	"crypto/ed25519"
+	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+
+	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
 
 type Server struct {
-	pubKey  ed25519.PublicKey
-	privKey ed25519.PrivateKey
+	privKey *ecdh.PrivateKey
+	pubKey  *ecdh.PublicKey
 	conn    *net.UDPConn
 	peers   map[[32]byte]Peer
 }
 
 func NewServer() (*Server, error) {
-	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	privKey, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
 	return &Server{
-		pubKey:  pubKey,
 		privKey: privKey,
+		pubKey:  privKey.PublicKey(),
 		peers:   make(map[[32]byte]Peer),
 	}, nil
 }
@@ -48,9 +51,10 @@ func (s *Server) readLoop() {
 		// First byte is message type:
 		// 	1 - handshake initiation
 		//  2 - handshake response
+		//  3 - cookie reply
 		//  4 - data message
-		// Next three bytes are always three zeros. Serve as padding
-		// for 32-bit alignment and future protocol extensions.
+		// Next three bytes are always three zeros. They serve as
+		// padding for 32-bit alignment and future protocol extensions.
 		buf := make([]byte, 4)
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -82,17 +86,18 @@ func (s *Server) handleHandshakeInit(r io.Reader, addr *net.UDPAddr) error {
 	// Random 32-bit number chosen by initiator.
 	// Identifies this specific handshake.
 	// Prevents replay attacks.
-	// Used in handshake response as `receiver` field, so peer can identify
-	// to which handshake initiation this response belongs.
+	// Used in handshake response as `receiver` field, so initiator can
+	// identify to which handshake initiation this response belongs.
 	var sender [4]byte
 	if err := binary.Read(r, binary.LittleEndian, &sender); err != nil {
 		return err
 	}
-	// 1. Initiator gets access to server's static public key from configuration before handshake.
+	// TODO: rewrite it because it's incorrect
+	// 1. Initiator gets server's static public key from configuration before handshake.
 	// 2. Initiator derives from its static private key and server's static public key shared secret.
-	// 3. Initiator encrypts with shared secret its static public key and sends it to the server.
+	// 3. Initiator encrypts with server's static public key its static public key and sends it to the server.
 	// 4. Server derives from its static private key and initiator's ephemeral public key shared secret.
-	// 5. Server decrypts initiator's static public key with shared secret.
+	// 5. Server decrypts initiator's static public key with its static private key.
 	//
 	// Initiator's ephemeral Curve25519 public key.
 	// Generated for each handshake and sent unencrypted.
@@ -103,7 +108,7 @@ func (s *Server) handleHandshakeInit(r io.Reader, addr *net.UDPAddr) error {
 	// initiatorSharedSecret = curve25519.X25519(initiatorStaticPrivateKey, serverStaticPublicKey)
 	// serverSharedSecret = curve25519.X25519(serverStaticPrivateKey, initiatorEphemeralPublicKey)
 	// initiatorSharedSecret == serverSharedSecret
-	sharedSecret, err := curve25519.X25519(s.privKey, ephemeral[:])
+	sharedSecret, err := curve25519.X25519(s.privKey.Bytes(), ephemeral[:])
 	if err != nil {
 		return err
 	}
@@ -114,6 +119,8 @@ func (s *Server) handleHandshakeInit(r io.Reader, addr *net.UDPAddr) error {
 	if err := binary.Read(r, binary.LittleEndian, &static); err != nil {
 		return err
 	}
+	// decrypt initiator's static public key
+
 	// Encrypted timestamp for replay protection.
 	var timestamp [12]byte
 	if err := binary.Read(r, binary.LittleEndian, &timestamp); err != nil {
@@ -139,7 +146,62 @@ func (s *Server) handleHandshakeInit(r io.Reader, addr *net.UDPAddr) error {
 	return nil
 }
 
+// https://www.wireguard.com/protocol/
 func (s *Server) sendHandshakeResp(receiver [4]byte) error {
+	var resp = new(HandshakeResp)
+	resp.typ = 2
+	sender := make([]byte, 4)
+	_, err := rand.Read(sender)
+	if err != nil {
+		return err
+	}
+	resp.sender = [4]byte(sender)
+	resp.receiver = receiver
+	ephemeralPrivate, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	resp.ephemeral = [32]byte(ephemeralPrivate.PublicKey().Bytes())
+	hasher, err := blake2s.New256(nil)
+	if err != nil {
+		return err
+	}
+	_, err = hasher.Write([]byte(construction))
+	if err != nil {
+		return err
+	}
+	chainingKey := hasher.Sum(nil)
+	hasher.Reset()
+	_, err = hasher.Write(chainingKey)
+	if err != nil {
+		return err
+	}
+	_, err = hasher.Write([]byte(identifier))
+	if err != nil {
+		return err
+	}
+	chainingKey2 := hasher.Sum(nil)
+	hasher.Reset()
+	_, err = hasher.Write(chainingKey2)
+	if err != nil {
+		return err
+	}
+	_, err = hasher.Write(s.pubKey.Bytes())
+	if err != nil {
+		return err
+	}
+	hash := hasher.Sum(nil)
+	temp := HMAC(chainingKey, resp.ephemeral[:])
+	chainingKey = HMAC(temp, []byte{1})
+	key := HMAC(temp, chainingKey, []byte{2})
+	// msg.encrypted_static = AEAD(key, 0, initiator.static_public, initiator.hash)
+	// aead, _ := chacha20poly1305.New(key[:])
+	// aead.Seal(msg.Empty[:0], ZeroNonce[:], nil, handshake.hash[:])
+	aead, err :=  chacha20poly1305.New(key)
+	if err != nil {
+		return err
+	}
+	resp := aead.Seal()
 	return nil
 }
 

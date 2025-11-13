@@ -1,11 +1,22 @@
 package main
 
+import (
+	"bufio"
+	"encoding/binary"
+	"io"
+)
+
 type MessageType uint8
 
 const (
 	handshakeInitType MessageType = 1
 	handshakeRespType MessageType = 2
 	dataMessageType   MessageType = 4
+)
+
+const (
+	construction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+	identifier = "WireGuard v1 zx2c4 Jason@zx2c4.com"
 )
 
 // Handshake establishes symmetric keys to be used for data transfer.
@@ -56,6 +67,7 @@ type HandshakeResp struct {
 	// Responder's ephemeral Curve25519 public key for key exchange.
 	// Generated for each handshake and sent unencrypted.
 	ephemeral [32]byte
+	// TODO: not sure what type of it should be
 	// Cryptographic authentication without payload.
 	// Provides cryptographic proof that responder has the correct keys.
 	empty [0]byte
@@ -65,6 +77,32 @@ type HandshakeResp struct {
 	// DoS protection.
 	// Mitigates amplification attacks by requiring computational work.
 	mac2 [16]byte
+}
+
+func (h *HandshakeResp) write(w io.Writer) error {
+	buf := bufio.NewWriter(w)
+	if err := binary.Write(buf, binary.LittleEndian, uint32(h.typ)); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, h.sender); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, h.receiver); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, h.ephemeral); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, h.empty); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, h.mac1); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, h.mac2); err != nil {
+		return err
+	}
+	return buf.Flush()
 }
 
 type DataMessage struct {
