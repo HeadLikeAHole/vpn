@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"encoding/binary"
 	"io"
+
+	"golang.org/x/crypto/blake2s"
 )
 
 type MessageType uint8
@@ -19,26 +21,37 @@ const (
 	identifier = "WireGuard v1 zx2c4 Jason@zx2c4.com"
 )
 
+var (
+	initialChainingKey []byte
+)
+
+func init() {
+	hasher, _ := blake2s.New256(nil)
+	// responder.chaining_key = HASH(CONSTRUCTION)
+	hasher.Write([]byte(construction))
+	chainingKey := hasher.Sum(nil)
+	hasher.Reset()
+	// responder.hash = HASH(responder.chaining_key || IDENTIFIER)
+	hasher.Write(chainingKey)
+	hasher.Write([]byte(identifier))
+	initialChainingKey = hasher.Sum(nil)
+}
+
 // Handshake establishes symmetric keys to be used for data transfer.
 // This handshake occurs every few minutes, in order to provide
 // rotating keys for forward secrecy.
 type HandshakeInit struct {
-	// Type of message. Always set to 1 for handshake initiation.
-	typ MessageType
-	// Always three zeros.
-	// Padding for 32-bit alignment and future protocol extensions.
-	reserved [3]byte
 	// Random 32-bit number chosen by initiator.
 	// Identifies this specific handshake.
-	// Prevents replay attacks.
-	// Used in response messages to match initiation.
+	// Used in handshake response as `receiver` field, so initiator can
+	// identify to which handshake this response belongs.
 	sender [4]byte
-	// Initiator's ephemeral Curve25519 public key for key exchange.
+	// Initiator's ephemeral Curve25519 public key.
 	// Generated for each handshake and sent unencrypted.
 	ephemeral [32]byte
 	// Initiator's long-term static public key.
-	// Derived from ephemeral keys.
-	// Encrypted to protect initiator's identity and to provide authentication.
+	// Encrypted to protect initiator's identity
+	// and to provide authentication.
 	static [32]byte
 	// Encrypted timestamp for replay protection.
 	timestamp [12]byte
@@ -49,6 +62,29 @@ type HandshakeInit struct {
 	// Mitigates DoS attacks by requiring computational work.
 	// Only included if responder previously sent a cookie.
 	mac2 [16]byte
+}
+
+func NewHandshakeInit(r io.Reader) (*HandshakeInit, error) {
+	h := new(HandshakeInit)
+	if err := binary.Read(r, binary.LittleEndian, h.sender); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.LittleEndian, h.ephemeral); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.LittleEndian, h.static); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.LittleEndian, h.timestamp); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.LittleEndian, h.mac1); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, binary.LittleEndian, h.mac2); err != nil {
+		return nil, err
+	}
+	return h, nil
 }
 
 type HandshakeResp struct {
@@ -79,7 +115,7 @@ type HandshakeResp struct {
 	mac2 [16]byte
 }
 
-func (h *HandshakeResp) write(w io.Writer) error {
+func (h *HandshakeResp) WriteToUDP(w io.Writer) error {
 	buf := bufio.NewWriter(w)
 	if err := binary.Write(buf, binary.LittleEndian, uint32(h.typ)); err != nil {
 		return err

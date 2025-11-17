@@ -15,6 +15,176 @@ import (
 	"time"
 )
 
+func mixKey(dst, c *[blake2s.Size]byte, data []byte) {
+	KDF1(dst, c[:], data)
+}
+
+func mixHash(dst, h *[blake2s.Size]byte, data []byte) {
+	hash, _ := blake2s.New256(nil)
+	hash.Write(h[:])
+	hash.Write(data)
+	hash.Sum(dst[:0])
+	hash.Reset()
+}
+
+func HMAC1(sum *[blake2s.Size]byte, key, in0 []byte) {
+	mac := hmac.New(func() hash.Hash {
+		h, _ := blake2s.New256(nil)
+		return h
+	}, key)
+	mac.Write(in0)
+	mac.Sum(sum[:0])
+}
+
+func HMAC2(sum *[blake2s.Size]byte, key, in0, in1 []byte) {
+	mac := hmac.New(func() hash.Hash {
+		h, _ := blake2s.New256(nil)
+		return h
+	}, key)
+	mac.Write(in0)
+	mac.Write(in1)
+	mac.Sum(sum[:0])
+}
+
+func KDF1(t0 *[blake2s.Size]byte, key, input []byte) {
+	HMAC1(t0, key, input)
+	HMAC1(t0, t0[:], []byte{0x1})
+}
+
+func KDF2(t0, t1 *[blake2s.Size]byte, key, input []byte) {
+	var prk [blake2s.Size]byte
+	HMAC1(&prk, key, input)
+	HMAC1(t0, prk[:], []byte{0x1})
+	HMAC2(t1, prk[:], t0[:], []byte{0x2})
+	setZero(prk[:])
+}
+
+func KDF3(t0, t1, t2 *[blake2s.Size]byte, key, input []byte) {
+	var prk [blake2s.Size]byte
+	HMAC1(&prk, key, input)
+	HMAC1(t0, prk[:], []byte{0x1})
+	HMAC2(t1, prk[:], t0[:], []byte{0x2})
+	HMAC2(t2, prk[:], t1[:], []byte{0x3})
+	setZero(prk[:])
+}
+
+func (sk *NoisePrivateKey) sharedSecret(pk NoisePublicKey) (ss [NoisePublicKeySize]byte, err error) {
+	apk := (*[NoisePublicKeySize]byte)(&pk)
+	ask := (*[NoisePrivateKeySize]byte)(sk)
+	curve25519.ScalarMult(&ss, ask, apk)
+	if isZero(ss[:]) {
+		return ss, errInvalidPublicKey
+	}
+	return ss, nil
+}
+
+
+func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+	var (
+		hash     [blake2s.Size]byte
+		chainKey [blake2s.Size]byte
+	)
+
+	if msg.Type != MessageInitiationType {
+		return nil
+	}
+
+	device.staticIdentity.RLock()
+	defer device.staticIdentity.RUnlock()
+
+	mixHash(&hash, &InitialHash, device.staticIdentity.publicKey[:])
+	mixHash(&hash, &hash, msg.Ephemeral[:])
+	mixKey(&chainKey, &InitialChainKey, msg.Ephemeral[:])
+
+	// decrypt static key
+	var peerPK NoisePublicKey
+	var key [chacha20poly1305.KeySize]byte
+	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+	if err != nil {
+		return nil
+	}
+	KDF2(&chainKey, &key, chainKey[:], ss[:])
+	aead, _ := chacha20poly1305.New(key[:])
+	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
+	if err != nil {
+		return nil
+	}
+	mixHash(&hash, &hash, msg.Static[:])
+
+	// lookup peer
+
+	peer := device.LookupPeer(peerPK)
+	if peer == nil || !peer.isRunning.Load() {
+		return nil
+	}
+
+	handshake := &peer.handshake
+
+	// verify identity
+
+	var timestamp tai64n.Timestamp
+
+	handshake.mutex.RLock()
+
+	if isZero(handshake.precomputedStaticStatic[:]) {
+		handshake.mutex.RUnlock()
+		return nil
+	}
+	KDF2(
+		&chainKey,
+		&key,
+		chainKey[:],
+		handshake.precomputedStaticStatic[:],
+	)
+	aead, _ = chacha20poly1305.New(key[:])
+	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
+	if err != nil {
+		handshake.mutex.RUnlock()
+		return nil
+	}
+	mixHash(&hash, &hash, msg.Timestamp[:])
+
+	// protect against replay & flood
+
+	replay := !timestamp.After(handshake.lastTimestamp)
+	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
+	handshake.mutex.RUnlock()
+	if replay {
+		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
+		return nil
+	}
+	if flood {
+		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake flood", peer)
+		return nil
+	}
+
+	// update handshake state
+
+	handshake.mutex.Lock()
+
+	handshake.hash = hash
+	handshake.chainKey = chainKey
+	handshake.remoteIndex = msg.Sender
+	handshake.remoteEphemeral = msg.Ephemeral
+	if timestamp.After(handshake.lastTimestamp) {
+		handshake.lastTimestamp = timestamp
+	}
+	now := time.Now()
+	if now.After(handshake.lastInitiationConsumption) {
+		handshake.lastInitiationConsumption = now
+	}
+	handshake.state = handshakeInitiationConsumed
+
+	handshake.mutex.Unlock()
+
+	setZero(hash[:])
+	setZero(chainKey[:])
+
+	return peer
+}
+
+
+
 // WireGuard constants
 const (
 	WG_PORT                 = 51820
@@ -37,7 +207,7 @@ type MessageHeader struct {
 	Reserved uint32
 }
 
-type HandshakeInit struct {
+type HandshakeIni struct {
 	Header          MessageHeader
 	SenderIndex     uint32
 	UnencryptedEphemeral [32]byte

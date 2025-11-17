@@ -83,95 +83,133 @@ func (s *Server) readLoop() {
 }
 
 func (s *Server) handleHandshakeInit(r io.Reader, addr *net.UDPAddr) error {
-	// Random 32-bit number chosen by initiator.
-	// Identifies this specific handshake.
-	// Prevents replay attacks.
-	// Used in handshake response as `receiver` field, so initiator can
-	// identify to which handshake initiation this response belongs.
-	var sender [4]byte
-	if err := binary.Read(r, binary.LittleEndian, &sender); err != nil {
+	h, err := NewHandshakeInit(r)
+	if err != nil {
 		return err
 	}
-	// TODO: rewrite it because it's incorrect
-	// 1. Initiator gets server's static public key from configuration before handshake.
-	// 2. Initiator derives from its static private key and server's static public key shared secret.
-	// 3. Initiator encrypts with server's static public key its static public key and sends it to the server.
-	// 4. Server derives from its static private key and initiator's ephemeral public key shared secret.
-	// 5. Server decrypts initiator's static public key with its static private key.
-	//
-	// Initiator's ephemeral Curve25519 public key.
-	// Generated for each handshake and sent unencrypted.
-	var ephemeral [32]byte
-	if err := binary.Read(r, binary.LittleEndian, &ephemeral); err != nil {
-		return err
-	}
-	// initiatorSharedSecret = curve25519.X25519(initiatorStaticPrivateKey, serverStaticPublicKey)
+	hash := HASH(initialChainingKey, s.privKey.PublicKey().Bytes())
+	hash = HASH(hash, h.ephemeral[:])
+	chainingKey := HMAC(initialChainingKey, h.ephemeral[:])
+	chainingKey = HMAC(chainingKey, []byte{1})
+	// initiatorSharedSecret = curve25519.X25519(initiatorEphemeralPrivateKey, serverStaticPublicKey)
 	// serverSharedSecret = curve25519.X25519(serverStaticPrivateKey, initiatorEphemeralPublicKey)
 	// initiatorSharedSecret == serverSharedSecret
 	sharedSecret, err := curve25519.X25519(s.privKey.Bytes(), ephemeral[:])
 	if err != nil {
 		return err
 	}
-	// Initiator's long-term static public key.
-	// Derived from ephemeral keys. Encrypted to protect
-	// initiator's identity and to provide authentication.
-	var static [32]byte
-	if err := binary.Read(r, binary.LittleEndian, &static); err != nil {
-		return err
+	temp := HMAC(chainingKey, sharedSecret)
+	chainingKey = HMAC(temp, []byte(1))
+	key := HMAC(temp, chainingKey, []byte(2))
+	var initiatorStaticPublic []byte
+	aead, _ := chacha20poly1305.New(key[:])
+	_, err = aead.Open(initiatorStaticPublic, []byte(0), h.static[:], hash[:])
+	if err != nil {
+		return nil
 	}
-	// decrypt initiator's static public key
+	hash = HASH(hash, h.static[:])
+	
+	// verify identity
 
-	// Encrypted timestamp for replay protection.
-	var timestamp [12]byte
-	if err := binary.Read(r, binary.LittleEndian, &timestamp); err != nil {
-		return err
+	var timestamp tai64n.Timestamp
+
+	handshake.mutex.RLock()
+
+	if isZero(handshake.precomputedStaticStatic[:]) {
+		handshake.mutex.RUnlock()
+		return nil
 	}
-	// Message authentication code.
-	// Verifies message integrity.
-	var mac1 [16]byte
-	if err := binary.Read(r, binary.LittleEndian, &mac1); err != nil {
-		return err
+	KDF2(
+		&chainKey,
+		&key,
+		chainKey[:],
+		handshake.precomputedStaticStatic[:],
+	)
+	aead, _ = chacha20poly1305.New(key[:])
+	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
+	if err != nil {
+		handshake.mutex.RUnlock()
+		return nil
 	}
-	// TODO: use a condition here
-	// DoS protection using cookie challenge.
-	// Mitigates DoS attacks by requiring computational work.
-	// Only included if responder previously sent a cookie.
-	var mac2 [16]byte
-	if err := binary.Read(r, binary.LittleEndian, &mac2); err != nil {
-		return err
+	mixHash(&hash, &hash, msg.Timestamp[:])
+
+	// protect against replay & flood
+
+	replay := !timestamp.After(handshake.lastTimestamp)
+	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
+	handshake.mutex.RUnlock()
+	if replay {
+		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
+		return nil
 	}
-	if err := s.sendHandshakeResp(sender); err != nil {
-		return err
+	if flood {
+		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake flood", peer)
+		return nil
 	}
-	return nil
+
+	// update handshake state
+
+	handshake.mutex.Lock()
+
+	handshake.hash = hash
+	handshake.chainKey = chainKey
+	handshake.remoteIndex = msg.Sender
+	handshake.remoteEphemeral = msg.Ephemeral
+	if timestamp.After(handshake.lastTimestamp) {
+		handshake.lastTimestamp = timestamp
+	}
+	now := time.Now()
+	if now.After(handshake.lastInitiationConsumption) {
+		handshake.lastInitiationConsumption = now
+	}
+	handshake.state = handshakeInitiationConsumed
+
+	handshake.mutex.Unlock()
+
+	setZero(hash[:])
+	setZero(chainKey[:])
+
+	return peer
+
 }
 
 // https://www.wireguard.com/protocol/
-func (s *Server) sendHandshakeResp(receiver [4]byte) error {
+func (s *Server) sendHandshakeResp(receiver [4]byte, initiatorStaticPublic) error {
 	var resp = new(HandshakeResp)
+	// responder.ephemeral_private = DH_GENERATE()
+	ephemeralPrivate, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	// msg.message_type = 2
+	// msg.reserved_zero = { 0, 0, 0 } - encoded later with
+	// message_type as little_endian(uint32(msg.message_type))
 	resp.typ = 2
+	// msg.sender_index = little_endian(responder.sender_index)
 	sender := make([]byte, 4)
 	_, err := rand.Read(sender)
 	if err != nil {
 		return err
 	}
+	// A 32-bit index that locally represents the other peer,
+	// analogous to IPsec’s “SPI”.
 	resp.sender = [4]byte(sender)
+	// msg.receiver_index = little_endian(initiator.sender_index)
 	resp.receiver = receiver
-	ephemeralPrivate, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return err
-	}
+	// msg.unencrypted_ephemeral = DH_PUBKEY(responder.ephemeral_private)
 	resp.ephemeral = [32]byte(ephemeralPrivate.PublicKey().Bytes())
 	hasher, err := blake2s.New256(nil)
 	if err != nil {
 		return err
 	}
+	// responder.chaining_key = HASH(CONSTRUCTION)
 	_, err = hasher.Write([]byte(construction))
 	if err != nil {
 		return err
 	}
 	chainingKey := hasher.Sum(nil)
 	hasher.Reset()
+	// responder.hash = HASH(HASH(responder.chaining_key || IDENTIFIER) || initiator.static_public)
 	_, err = hasher.Write(chainingKey)
 	if err != nil {
 		return err
@@ -186,13 +224,46 @@ func (s *Server) sendHandshakeResp(receiver [4]byte) error {
 	if err != nil {
 		return err
 	}
-	_, err = hasher.Write(s.pubKey.Bytes())
+	_, err = hasher.Write(initiatorStaticPublic)
 	if err != nil {
 		return err
 	}
 	hash := hasher.Sum(nil)
+	hasher.Reset()
+	// responder.hash = HASH(responder.hash || msg.unencrypted_ephemeral)
+	_, err = hasher.Write(hash)
+	if err != nil {
+		return err
+	}
+	_, err = hasher.Write(resp.ephemeral[:])
+	if err != nil {
+		return err
+	}
+	hash = hasher.Sum(nil)
+	// temp = HMAC(responder.chaining_key, msg.unencrypted_ephemeral)
 	temp := HMAC(chainingKey, resp.ephemeral[:])
+	// responder.chaining_key = HMAC(temp, 0x1)
 	chainingKey = HMAC(temp, []byte{1})
+	// temp = HMAC(responder.chaining_key, DH(responder.ephemeral_private, initiator.ephemeral_public))
+	temp2, err := curve25519.X25519(ephemeralPrivate, initiatorEphemeralPublic)
+	if err != nil {
+		return err
+	}
+	temp = HMAC(chainingKey, temp2)
+	// responder.chaining_key = HMAC(temp, 0x1)
+	chainingKey = HMAC(temp, []byte{1})
+	// temp = HMAC(responder.chaining_key, DH(responder.ephemeral_private, initiator.static_public))
+	temp2, err = curve25519.X25519(ephemeralPrivate, initiatorStaticPublic)
+	if err != nil {
+		return err
+	}
+	temp = HMAC(chainingKey, temp2)
+	// responder.chaining_key = HMAC(temp, 0x1)
+	chainingKey = HMAC(temp, []byte{1})
+	// temp = HMAC(responder.chaining_key, preshared_key)
+	// TODO: what is preshared_key?
+
+
 	key := HMAC(temp, chainingKey, []byte{2})
 	// msg.encrypted_static = AEAD(key, 0, initiator.static_public, initiator.hash)
 	// aead, _ := chacha20poly1305.New(key[:])
@@ -204,6 +275,30 @@ func (s *Server) sendHandshakeResp(receiver [4]byte) error {
 	resp := aead.Seal()
 	return nil
 }
+
+
+
+
+
+
+
+
+
+
+
+// responder.chaining_key = HMAC(temp, 0x1)
+// temp2 = HMAC(temp, responder.chaining_key || 0x2)
+// key = HMAC(temp, temp2 || 0x3)
+// responder.hash = HASH(responder.hash || temp2)
+
+// msg.encrypted_nothing = AEAD(key, 0, [empty], responder.hash)
+// responder.hash = HASH(responder.hash || msg.encrypted_nothing)
+
+// msg.mac1 = MAC(HASH(LABEL_MAC1 || initiator.static_public), msg[0:offsetof(msg.mac1)])
+// if (responder.last_received_cookie is empty or expired)
+//     msg.mac2 = [zeros]
+// else
+//     msg.mac2 = MAC(responder.last_received_cookie, msg[0:offsetof(msg.mac2)])
 
 type Peer struct {
 	// 32 bytes
