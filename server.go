@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 
+	"github.com/HeadLikeAHole/vpn/tai64n"
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
@@ -17,7 +18,7 @@ type Server struct {
 	privKey *ecdh.PrivateKey
 	pubKey  *ecdh.PublicKey
 	conn    *net.UDPConn
-	peers   map[[32]byte]Peer
+	peers   map[ed25519.PublicKey]Peer
 }
 
 func NewServer() (*Server, error) {
@@ -94,73 +95,54 @@ func (s *Server) handleHandshakeInit(r io.Reader, addr *net.UDPAddr) error {
 	// initiatorSharedSecret = curve25519.X25519(initiatorEphemeralPrivateKey, serverStaticPublicKey)
 	// serverSharedSecret = curve25519.X25519(serverStaticPrivateKey, initiatorEphemeralPublicKey)
 	// initiatorSharedSecret == serverSharedSecret
-	sharedSecret, err := curve25519.X25519(s.privKey.Bytes(), ephemeral[:])
+	ephemeralSharedSecret, err := curve25519.X25519(s.privKey.Bytes(), ephemeral[:])
 	if err != nil {
 		return err
 	}
-	temp := HMAC(chainingKey, sharedSecret)
-	chainingKey = HMAC(temp, []byte(1))
-	key := HMAC(temp, chainingKey, []byte(2))
-	var initiatorStaticPublic []byte
+	temp := HMAC(chainingKey, ephemeralSharedSecret)
+	chainingKey = HMAC(temp, []byte{1})
+	key := HMAC(temp, chainingKey, []byte{2})
 	aead, _ := chacha20poly1305.New(key[:])
+	var initiatorStaticPublic []byte
 	_, err = aead.Open(initiatorStaticPublic, []byte(0), h.static[:], hash[:])
 	if err != nil {
 		return nil
 	}
 	hash = HASH(hash, h.static[:])
-	
-	// verify identity
-
+	peer, ok := s.peers[initiatorStaticPublic]
+	if !ok {
+		return nil
+	}
+	if isZero(peer.staticSharedSecret) {
+		return nil
+	}
+	temp = HMAC(chainingKey, peer.staticSharedSecret)
+	chainingKey = HMAC(temp, []byte{1})
+	key = HMAC(temp, chainingKey, []byte{2})
+	aead, _ := chacha20poly1305.New(key[:])
 	var timestamp tai64n.Timestamp
-
-	handshake.mutex.RLock()
-
-	if isZero(handshake.precomputedStaticStatic[:]) {
-		handshake.mutex.RUnlock()
-		return nil
-	}
-	KDF2(
-		&chainKey,
-		&key,
-		chainKey[:],
-		handshake.precomputedStaticStatic[:],
-	)
-	aead, _ = chacha20poly1305.New(key[:])
-	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
+	_, err = aead.Open(timestamp[:], []byte{0}, h.timestamp[:], hash[:])
 	if err != nil {
-		handshake.mutex.RUnlock()
 		return nil
 	}
-	mixHash(&hash, &hash, msg.Timestamp[:])
-
-	// protect against replay & flood
-
-	replay := !timestamp.After(handshake.lastTimestamp)
-	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
-	handshake.mutex.RUnlock()
-	if replay {
-		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
+	hash = HASH(hash, h.timestamp[:])
+	// protect against replay and DoS attack
+	isReplay := !timestamp.After(peer.session.lastTimestamp)
+	isDoS := time.Since(peer.session.latestHandshakeInit) <= handshakeInitRate
+	if isReplay || isDoS {
+		// TODO: print some message here
 		return nil
 	}
-	if flood {
-		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake flood", peer)
-		return nil
-	}
-
-	// update handshake state
-
-	handshake.mutex.Lock()
-
-	handshake.hash = hash
-	handshake.chainKey = chainKey
-	handshake.remoteIndex = msg.Sender
-	handshake.remoteEphemeral = msg.Ephemeral
-	if timestamp.After(handshake.lastTimestamp) {
-		handshake.lastTimestamp = timestamp
+	peer.session.hash = hash
+	peer.session.chainingKey = chainingKey
+	peer.session.remoteIndex = h.sender
+	peer.session.remoteEphemeral = h.ephemeral
+	if timestamp.After(peer.session.latestTimestamp) {
+		peer.session.latestTimestamp = timestamp
 	}
 	now := time.Now()
-	if now.After(handshake.lastInitiationConsumption) {
-		handshake.lastInitiationConsumption = now
+	if now.After(peer.session.latestHandshakeInit) {
+		peer.session.latestHandshakeInit = now
 	}
 	handshake.state = handshakeInitiationConsumed
 
@@ -299,9 +281,3 @@ func (s *Server) sendHandshakeResp(receiver [4]byte, initiatorStaticPublic) erro
 //     msg.mac2 = [zeros]
 // else
 //     msg.mac2 = MAC(responder.last_received_cookie, msg[0:offsetof(msg.mac2)])
-
-type Peer struct {
-	// 32 bytes
-	publicKey  ed25519.PublicKey
-	allowedIPs []net.IP
-}
