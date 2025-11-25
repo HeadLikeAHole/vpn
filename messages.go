@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"io"
 
+	"github.com/HeadLikeAHole/vpn/tai64n"
 	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 type MessageType uint8
@@ -18,20 +20,29 @@ const (
 )
 
 var (
-	initialChainingKey []byte
+	initialChainingKey [blake2s.Size]byte
+	initialHash        [blake2s.Size]byte
+	zeroNonce          [chacha20poly1305.NonceSize]byte
 )
 
 func init() {
-	hasher, _ := blake2s.New256(nil)
 	// responder.chaining_key = HASH(CONSTRUCTION)
-	hasher.Write([]byte(construction))
-	chainingKey := hasher.Sum(nil)
-	hasher.Reset()
+	initialChainingKey = [blake2s.Size]byte(HASH([]byte(construction)))
 	// responder.hash = HASH(responder.chaining_key || IDENTIFIER)
-	hasher.Write(chainingKey)
-	hasher.Write([]byte(identifier))
-	initialChainingKey = hasher.Sum(nil)
+	initialHash = [blake2s.Size]byte(HASH(initialChainingKey[:], []byte(identifier)))
 }
+
+const (
+	privateKeySize   = 32
+	publicKeySize    = 32
+	presharedKeySize = 32
+)
+
+type (
+	privateKeyType   [privateKeySize]byte
+	publicKeyType    [publicKeySize]byte
+	presharedKeyType [presharedKeySize]byte
+)
 
 // Handshake establishes symmetric keys to be used for data transfer.
 // This handshake occurs every few minutes, in order to provide
@@ -44,23 +55,23 @@ type HandshakeInit struct {
 	sender [4]byte
 	// Initiator's ephemeral Curve25519 public key.
 	// Generated for each handshake and sent unencrypted.
-	ephemeral [32]byte
+	ephemeral publicKeyType
 	// Initiator's long-term static public key.
 	// Encrypted to protect initiator's identity
 	// and to provide authentication.
-	static [32]byte
+	static [publicKeySize + chacha20poly1305.Overhead]byte
 	// Encrypted timestamp for replay protection.
-	timestamp [12]byte
+	timestamp [tai64n.TimestampSize + chacha20poly1305.Overhead]byte
 	// Message authentication code.
 	// Verifies message integrity.
-	mac1 [16]byte
+	mac1 [blake2s.Size128]byte
 	// DoS protection using cookie challenge.
 	// Mitigates DoS attacks by requiring computational work.
 	// Only included if responder previously sent a cookie.
-	mac2 [16]byte
+	mac2 [blake2s.Size128]byte
 }
 
-func NewHandshakeInit(r io.Reader) (*HandshakeInit, error) {
+func ParseHandshakeInit(r io.Reader) (*HandshakeInit, error) {
 	h := new(HandshakeInit)
 	if err := binary.Read(r, binary.LittleEndian, h.sender); err != nil {
 		return nil, err
@@ -98,17 +109,17 @@ type HandshakeResp struct {
 	receiver [4]byte
 	// Responder's ephemeral Curve25519 public key for key exchange.
 	// Generated for each handshake and sent unencrypted.
-	ephemeral [32]byte
+	ephemeral publicKeyType
 	// TODO: not sure what type of it should be
 	// Cryptographic authentication without payload.
 	// Provides cryptographic proof that responder has the correct keys.
-	empty [0]byte
+	empty [chacha20poly1305.Overhead]byte
 	// Message authentication code.
 	// Verifies message integrity and authenticates the responder.
-	mac1 [16]byte
+	mac1 [blake2s.Size128]byte
 	// DoS protection.
 	// Mitigates amplification attacks by requiring computational work.
-	mac2 [16]byte
+	mac2 [blake2s.Size128]byte
 }
 
 func (h *HandshakeResp) WriteToUDP(w io.Writer) error {

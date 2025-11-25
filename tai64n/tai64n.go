@@ -7,6 +7,7 @@ import (
 )
 
 const (
+	TimestampSize = 12
 	// By adding this large base value, WireGuard guarantees
 	// that all TAI64N timestamps are positive 64-bit integers,
 	// avoiding issues with signed/unsigned integer handling
@@ -17,7 +18,7 @@ const (
 
 // First 8 bytes are seconds, last 4 bytes nanoseconds.
 // Values encoded in big-endian order.
-type Timestamp [12]byte
+type Timestamp [TimestampSize]byte
 
 func new(t time.Time) Timestamp {
 	secs := base + uint64(t.Unix())

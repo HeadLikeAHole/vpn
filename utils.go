@@ -9,15 +9,15 @@ import (
 )
 
 // HASH hashes inputs using BLAKE2s hash algorithm
-func HASH(inputs ...[]byte) []byte {
+func HASH(inputs ...[]byte) [blake2s.Size]byte {
 	hasher, _ := blake2s.New256(nil)
 	for _, input := range inputs {
 		hasher.Write(input)
 	}
-	return hasher.Sum(nil)
+	return [blake2s.Size]byte(hasher.Sum(nil))
 }
 
-func HMAC(key []byte, inputs ...[]byte) []byte {
+func HMAC(key []byte, inputs ...[]byte) [blake2s.Size]byte {
 	hasher := hmac.New(func() hash.Hash {
 		h, _ := blake2s.New256(nil)
 		return h
@@ -25,7 +25,7 @@ func HMAC(key []byte, inputs ...[]byte) []byte {
 	for _, input := range inputs {
 		hasher.Write(input)
 	}
-	return hasher.Sum(nil)
+	return [blake2s.Size]byte(hasher.Sum(nil))
 }
 
 // func isZeroNaive(val []byte) bool {
