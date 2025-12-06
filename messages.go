@@ -10,44 +10,19 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-type MessageType uint8
+type messageType uint8
 
 const (
-	handshakeInitType MessageType = 1
-	handshakeRespType MessageType = 2
-	cookieReplyType   MessageType = 3
-	transportDataType MessageType = 4
-)
-
-var (
-	initialChainingKey [blake2s.Size]byte
-	initialHash        [blake2s.Size]byte
-	zeroNonce          [chacha20poly1305.NonceSize]byte
-)
-
-func init() {
-	// responder.chaining_key = HASH(CONSTRUCTION)
-	initialChainingKey = [blake2s.Size]byte(HASH([]byte(construction)))
-	// responder.hash = HASH(responder.chaining_key || IDENTIFIER)
-	initialHash = [blake2s.Size]byte(HASH(initialChainingKey[:], []byte(identifier)))
-}
-
-const (
-	privateKeySize   = 32
-	publicKeySize    = 32
-	presharedKeySize = 32
-)
-
-type (
-	privateKeyType   [privateKeySize]byte
-	publicKeyType    [publicKeySize]byte
-	presharedKeyType [presharedKeySize]byte
+	handshakeInitType messageType = 1
+	handshakeRespType messageType = 2
+	cookieReplyType   messageType = 3
+	transportDataType messageType = 4
 )
 
 // Handshake establishes symmetric keys to be used for data transfer.
 // This handshake occurs every few minutes, in order to provide
 // rotating keys for forward secrecy.
-type HandshakeInit struct {
+type handshakeInit struct {
 	// Random 32-bit number chosen by initiator.
 	// Identifies this specific handshake.
 	// Used in handshake response as `receiver` field, so initiator can
@@ -71,8 +46,9 @@ type HandshakeInit struct {
 	mac2 [blake2s.Size128]byte
 }
 
-func ParseHandshakeInit(r io.Reader) (*HandshakeInit, error) {
-	h := new(HandshakeInit)
+// TODO: buffer the reader
+func parseHandshakeInit(r io.Reader) (*handshakeInit, error) {
+	h := new(handshakeInit)
 	if err := binary.Read(r, binary.LittleEndian, h.sender); err != nil {
 		return nil, err
 	}
@@ -94,7 +70,7 @@ func ParseHandshakeInit(r io.Reader) (*HandshakeInit, error) {
 	return h, nil
 }
 
-type HandshakeResp struct {
+type handshakeResp struct {
 	// Type of message. Always set to 2 for handshake response.
 	typ uint8
 	// Always three zeros.
@@ -122,7 +98,7 @@ type HandshakeResp struct {
 	mac2 [blake2s.Size128]byte
 }
 
-func (h *HandshakeResp) WriteToUDP(w io.Writer) error {
+func (h *handshakeResp) writeToUDP(w io.Writer) error {
 	buf := bufio.NewWriter(w)
 	if err := binary.Write(buf, binary.LittleEndian, uint32(h.typ)); err != nil {
 		return err
@@ -148,7 +124,7 @@ func (h *HandshakeResp) WriteToUDP(w io.Writer) error {
 	return buf.Flush()
 }
 
-type DataMessage struct {
+type dataMessage struct {
 	// Type of message. Always set to 4 for data message.
 	typ uint8
 	// Always three zeros.

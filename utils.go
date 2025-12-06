@@ -64,3 +64,9 @@ func isZero(val []byte) bool {
 	}
 	return acc == 1
 }
+
+func zeroOut(s []byte) {
+	for i := range s {
+		s[i] = 0
+	}
+}

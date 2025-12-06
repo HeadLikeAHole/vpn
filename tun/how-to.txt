@@ -1,0 +1,16 @@
+# Create TUN interface
+ip tuntap add mode tun dev tun0
+ip addr add 10.0.0.1/24 dev tun0
+ip link set tun0 up
+
+# Test 1: Ping TUN itself (works)
+ping 10.0.0.1
+
+# Test 2: Ping through TUN (won't work without routes)
+ping -I tun0 8.8.8.8  # Fails!
+
+# Add route for Google DNS
+ip route add 8.8.8.8 via 10.0.0.1 dev tun0
+
+# Now this works (if your TUN program routes it)
+ping -I tun0 8.8.8.8

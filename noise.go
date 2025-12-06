@@ -1,12 +1,11 @@
+// noise protocol implementation
 package main
 
 import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"errors"
-	"fmt"
 	"io"
-	"net"
 	"time"
 
 	"github.com/HeadLikeAHole/vpn/tai64n"
@@ -15,75 +14,38 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
-type Server struct {
-	privateKey privateKeyType
-	publicKey  publicKeyType
-	conn       *net.UDPConn
-	peers      map[publicKeyType]Peer
+const (
+	construction = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+	identifier   = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+)
+
+var (
+	initialChainingKey [blake2s.Size]byte
+	initialHash        [blake2s.Size]byte
+	zeroNonce          [chacha20poly1305.NonceSize]byte
+)
+
+func init() {
+	// responder.chaining_key = HASH(CONSTRUCTION)
+	initialChainingKey = [blake2s.Size]byte(HASH([]byte(construction)))
+	// responder.hash = HASH(responder.chaining_key || IDENTIFIER)
+	initialHash = [blake2s.Size]byte(HASH(initialChainingKey[:], []byte(identifier)))
 }
 
-func NewServer() (*Server, error) {
-	privateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	return &Server{
-		privateKey: [32]byte(privateKey.Bytes()),
-		publicKey:  [32]byte(privateKey.PublicKey().Bytes()),
-		peers:      make(map[publicKeyType]Peer),
-	}, nil
-}
+const (
+	privateKeySize   = 32
+	publicKeySize    = 32
+	presharedKeySize = 32
+)
 
-func (s *Server) Start(port int) error {
-	addr := &net.UDPAddr{
-		IP:   net.IPv4(0, 0, 0, 0),
-		Port: port,
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return err
-	}
-	s.conn = conn
-	fmt.Println("Server is listening on port:", port)
-	return nil
-}
+type (
+	privateKeyType   [privateKeySize]byte
+	publicKeyType    [publicKeySize]byte
+	presharedKeyType [presharedKeySize]byte
+)
 
-func (s *Server) readLoop() {
-	for {
-		// First byte is message type:
-		// 	1 - handshake initiation
-		//  2 - handshake response
-		//  3 - cookie reply
-		//  4 - data message
-		// Next three bytes are always three zeros. They serve as
-		// padding for 32-bit alignment and future protocol extensions.
-		buf := make([]byte, 4)
-		n, addr, err := s.conn.ReadFromUDP(buf)
-		if err != nil {
-			fmt.Println("Read error:", err)
-			continue
-		}
-		data := buf[:n]
-		if len(data) < 4 {
-			continue
-		}
-		typ := MessageType(data[0])
-		switch typ {
-		case handshakeInitType:
-			peer, err := s.processHandshakeInit(s.conn, addr)
-		case transportDataType:
-			err = s.handleTransportData(data, addr)
-		default:
-			fmt.Println("Unknown message type:", typ)
-		}
-		if err != nil {
-			fmt.Println("Error processing message:", err)
-		}
-	}
-}
-
-func (s *Server) processHandshakeInit(r io.Reader, addr *net.UDPAddr) (*Peer, error) {
-	h, err := ParseHandshakeInit(r)
+func processHandshakeInit(d *device, r io.Reader) (*peer, error) {
+	h, err := parseHandshakeInit(r)
 	if err != nil {
 		return nil, err
 	}
@@ -91,14 +53,14 @@ func (s *Server) processHandshakeInit(r io.Reader, addr *net.UDPAddr) (*Peer, er
 		hash [blake2s.Size]byte
 		chainingKey [blake2s.Size]byte
 	)
-	hash = HASH(initialHash[:], s.publicKey[:])
+	hash = HASH(initialHash[:], d.publicKey[:])
 	hash = HASH(hash[:], h.ephemeral[:])
 	chainingKey = HMAC(initialChainingKey[:], h.ephemeral[:])
 	chainingKey = HMAC(chainingKey[:], []byte{1})
 	// initiatorSharedSecret = curve25519.X25519(initiatorEphemeralPrivateKey, serverStaticPublicKey)
 	// serverSharedSecret = curve25519.X25519(serverStaticPrivateKey, initiatorEphemeralPublicKey)
 	// initiatorSharedSecret == serverSharedSecret
-	ephemeralSharedSecret, err := curve25519.X25519(s.privateKey[:], h.ephemeral[:])
+	ephemeralSharedSecret, err := curve25519.X25519(d.privateKey[:], h.ephemeral[:])
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +75,7 @@ func (s *Server) processHandshakeInit(r io.Reader, addr *net.UDPAddr) (*Peer, er
 		return nil, err
 	}	
 	hash = HASH(hash[:], h.static[:])
-	peer, ok := s.peers[initiatorStaticPublic]
+	peer, ok := d.peers[initiatorStaticPublic]
 	if !ok {
 		return nil, errors.New("peer not found")
 	}
@@ -154,9 +116,8 @@ func (s *Server) processHandshakeInit(r io.Reader, addr *net.UDPAddr) (*Peer, er
 }
 
 // https://www.wireguard.com/protocol/
-func (s *Server) sendHandshakeResp(peer *Peer) (*HandshakeResp, error) {
-	sess := &peer.session
-	var resp = new(HandshakeResp)
+func createHandshakeResp(sess *session) (*handshakeResp, error) {
+	var resp = new(handshakeResp)
 	resp.typ = 2
 	// TODO: probably should be generated earlier
 	sender := make([]byte, 4)
@@ -197,3 +158,19 @@ func (s *Server) sendHandshakeResp(peer *Peer) (*HandshakeResp, error) {
 	sess.hash = HASH(sess.hash[:], temp2[:])
 	return resp, nil
 }
+
+func deriveDataKeys(sess *session) {
+	temp := HMAC(sess.chainingKey[:])
+	receivingKey := HMAC(temp[:], []byte{1})
+	sendingKey := HMAC(temp[:], receivingKey[:], []byte{2})
+	zeroOut(sess.localEphemeralPrivate[:])
+	zeroOut(sess.remoteEphemeralPublic[:])
+	zeroOut(sess.hash[:])
+	zeroOut(sess.chainingKey[:])
+	sess.sendingKey, _ = chacha20poly1305.New(sendingKey[:])
+	sess.receivingKey, _ = chacha20poly1305.New(receivingKey[:])
+}
+
+// func processTransportData(peer *peer) (*handshakeResp, error) {
+	
+// }

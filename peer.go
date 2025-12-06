@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/cipher"
 	"net"
 	"time"
 
@@ -8,12 +9,12 @@ import (
 	"golang.org/x/crypto/blake2s"
 )
 
-type Peer struct {
+type peer struct {
 	allowedIPs []net.IP
-	session    Session
+	session    session
 }
 
-type Session struct {
+type session struct {
 	remoteStaticPublic publicKeyType
 	// Derived from own static private and other side's static public.
 	// Precomputed when peer is added "manually" to the server.
@@ -32,4 +33,10 @@ type Session struct {
 	latestTimestamp tai64n.Timestamp
 	// prevents processing too many handshakes too quickly (DoS protection)
 	latestHandshakeInit time.Time
+	
+	// symmetric keys
+	sendingKey       cipher.AEAD
+	receivingKey     cipher.AEAD
+	sendingCounter   uint64
+	receivingCounter uint64
 }
